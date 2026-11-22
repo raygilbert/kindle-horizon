@@ -32,6 +32,13 @@ local function finite(value)
     if n and n == n and n ~= math.huge and n ~= -math.huge then return n end
 end
 
+-- Seconds to wait before asking CelesTrak again after the nth failed request in a row:
+-- 6 hours, then 12, then 24 (the longest).
+function Satellites.backoff(failures)
+    local n = math.max(1, math.floor(tonumber(failures) or 1))
+    return math.min(24, 6 * 2 ^ (n - 1)) * 3600
+end
+
 function Satellites.parse(response, now)
     if type(response) ~= "table" then return nil end
     local found, seen = {}, {}
