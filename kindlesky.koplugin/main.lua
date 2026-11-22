@@ -1041,7 +1041,10 @@ function Sky:init()
     if type(self.catalog) ~= "table" then self.catalog = nil end
     self.catalog_updated_at = self.catalog_file:readSetting("updated_at")
     self.catalog_checked_at = self.catalog_file:readSetting("checked_at")
-    self.catalog_halted = self.catalog_file:readSetting("halted") == true
+    -- An older version stopped for good after one HTTP error ("halted"); that flag is ignored now.
+    self.catalog_failures = tonumber(self.catalog_file:readSetting("failures")) or 0
+    self.catalog_retry_at = tonumber(self.catalog_file:readSetting("retry_at"))
+    self.catalog_last_error = self.catalog_file:readSetting("last_error")
     if self.settings.landscape == nil then self.settings.landscape = true end
     if self.settings.auto_rotate == nil then self.settings.auto_rotate = true end
     if not Time.isValidZone(self.settings.timezone) then self.settings.timezone = "auto" end
@@ -1420,7 +1423,10 @@ function Sky:saveCatalog()
     self.catalog_file:saveSetting("catalog", self.catalog)
     self.catalog_file:saveSetting("updated_at", self.catalog_updated_at)
     self.catalog_file:saveSetting("checked_at", self.catalog_checked_at)
-    self.catalog_file:saveSetting("halted", self.catalog_halted or false)
+    self.catalog_file:delSetting("halted")
+    self.catalog_file:saveSetting("failures", self.catalog_failures or 0)
+    self.catalog_file:saveSetting("retry_at", self.catalog_retry_at)
+    self.catalog_file:saveSetting("last_error", self.catalog_last_error)
     self.catalog_file:flush()
 end
 
@@ -1577,7 +1583,7 @@ function Sky:refresh()
     self.satellites = self.catalog and Satellites.overhead(self.catalog, os.time(),
         self.settings.lat, self.settings.lon, 10) or nil
     if self.catalog_updated_at and os.time() - self.catalog_updated_at > 3 * 86400 then
-        self.satellite_error = "Orbital data expired"
+        self.satellite_error = "Orbital data expired" .. (self.catalog_last_error and (" (" .. self.catalog_last_error .. ")") or "")
     end
     if not NetworkMgr:isConnected() then
         self.aircraft_error = "Wi-Fi offline"
@@ -1637,7 +1643,7 @@ function Sky:refreshData()
         self.aircraft_error = aircraft_error or "Aircraft data unavailable"
         if not self.aircraft_updated_at or os.time() - self.aircraft_updated_at > 600 then self.aircraft = nil end
     end
-    if not self.catalog_halted and (not self.catalog_checked_at
+    if (not self.catalog_retry_at or os.time() >= self.catalog_retry_at) and (not self.catalog_checked_at
         or os.time() - self.catalog_checked_at >= CATALOG_SECONDS) then
         self.catalog_checked_at = os.time()
         local response, request_error = get_json("https://celestrak.org/NORAD/elements/gp.php?GROUP=VISUAL&FORMAT=JSON")
@@ -1647,6 +1653,7 @@ function Sky:refreshData()
             for _, sat in ipairs(catalog or {}) do
                 if sat.id == 25544 then has_iss = true; break end
             end
+            local iss_backoff = false
             if catalog and not has_iss then
                 local iss_response, iss_error = get_json("https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=JSON")
                 if iss_response then
@@ -1654,19 +1661,31 @@ function Sky:refreshData()
                         catalog[#catalog + 1] = sat
                     end
                 elseif iss_error and iss_error:match("^HTTP ") then
-                    self.catalog_halted = true
+                    diag("orbital catalog", "ISS request: CelesTrak " .. iss_error)
+                    iss_backoff = true
                 end
             end
             if catalog and #catalog > 0 then
                 self.catalog, self.catalog_updated_at = catalog, os.time()
                 self.satellite_error = nil
+                self.catalog_failures, self.catalog_retry_at, self.catalog_last_error = 0, nil, nil
+                -- The extra ISS request was refused: leave CelesTrak alone for a while, keep the catalog.
+                if iss_backoff then self.catalog_retry_at = os.time() + Satellites.backoff(1) end
             else
                 self.satellite_error = "Orbital catalog unavailable"
             end
         else
             self.satellite_error = request_error or "Orbital catalog unavailable"
             if request_error and request_error:match("^HTTP ") then
-                self.catalog_halted = true
+                -- CelesTrak asks clients to stop on a non-200 answer. Wait, and wait longer each time,
+                -- but try again so one bad answer does not end satellite tracking for good.
+                self.catalog_failures = (self.catalog_failures or 0) + 1
+                local wait = Satellites.backoff(self.catalog_failures)
+                self.catalog_retry_at = os.time() + wait
+                self.catalog_last_error = "CelesTrak " .. request_error
+                self.satellite_error = string.format("CelesTrak %s, trying again in %d h", request_error, math.floor(wait / 3600))
+                diag("orbital catalog", string.format("%s, failure %d, next try in %d h", request_error,
+                    self.catalog_failures, math.floor(wait / 3600)))
             end
         end
         self:saveCatalog()
@@ -1834,7 +1853,7 @@ function Sky:addToMainMenu(menu_items)
               end },
             { text = _("Set location and refresh"), callback = function() self:configure() end },
             { text = _("Retry satellite catalog"), callback = function()
-                  self.catalog_halted, self.catalog_checked_at = nil, nil
+                  self.catalog_failures, self.catalog_retry_at, self.catalog_checked_at = 0, nil, nil
                   self:saveCatalog()
                   if self.running then self.refresh_task() end
               end },
